@@ -5,34 +5,35 @@
 #include "heat_simulation.h"
 #include "cuda_utils.cuh"
 
-// ====================== VARIABLES GLOBALES (HOST) ======================
-// Estas dos son usadas por main.c (HOST).
-float *grid = NULL; // HOST: buffer que pinta OpenGL en main.c en cada tick
-int grid_size = 0;  // HOST: lado N de la grilla
+float *grid = NULL; // buffer en CPU de grilla.
+int grid_size = 0;  // lado N de la grilla (N x N celdas)
 
-// Buffer reutilizable en HOST para la reducción
+// buffer en host para la reducción (cálculo del promedio).
 static float *h_partial = NULL;
 static int h_partial_capacity = 0;
 
-// Parámetros del modelo (HOST)
-static float diffusion_rate = 0.25f; // HOST: coeficiente D.
+// diffusion_rate es el coeficiente de difusión D del modelo.
+static float diffusion_rate = 0.25f;
 
 // ====================== CONTROL DE EQUILIBRIO ======================
-// Criterio de convergencia: |Ḡ^(t+1) − Ḡ^t| <= EPSILON
+// uso el criterio |prom(G(t+1)) - prom(G(t))| <= EPSILON, donde prom(G(t)) es el promedio de la grilla.
 static const float EPSILON = 0.000471f;
 static int equilibrium_reached = 0;
 static float prev_avg = 0.0f;
 static int has_prev_avg = 0;
 
 // ====================== BUFFERS EN DEVICE (GPU) ======================
-static float *d_grid = NULL;     // DEVICE global memory: estado T(t)
-static float *d_new = NULL;      // DEVICE global memory: estado T(t+1)
-static float *d_partial = NULL;  // DEVICE global memory: resultados parciales de reducción
-static int d_partial_blocks = 0; // Número de bloques usados en la reducción
+// En la GPU guardo el estado actual y el siguiente.
+static float *d_grid = NULL; // estado T(t)
+static float *d_new = NULL;  // estado T(t+1)
+
+// buffer en GPU para las sumas parciales de la reduccion.
+static float *d_partial = NULL;  // sumas parciales de la reduccion
+static int d_partial_blocks = 0; // cantidad de bloques usados en la reduccion
 
 // ====================== KERNEL DE REDUCCIÓN (DEVICE) ======================
-// Reducción paralela para sumar un arreglo de floats siguiendo el esquema
-// "Reduction #4: First Add During Load" de Mark Harris.
+// hago una reduccion paralela para sumar un arreglo de floats.
+// siguiendo el esquema "Reduction #4: First Add During Load" de Mark Harris o tambien esta en la diapositiva 21 del pdf "Ejemplo de aplicación Reducción Optimización" de Adrian Pousa.
 __global__ void reduce_first_add(const float *g_idata, float *g_odata, unsigned int n)
 {
     extern __shared__ float sdata[];
@@ -53,7 +54,7 @@ __global__ void reduce_first_add(const float *g_idata, float *g_odata, unsigned 
     sdata[tid] = mySum;
     __syncthreads();
 
-    // Reducción secuencial en shared memory
+    // reduzco en shared memory dentro del bloque.
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
     {
         if (tid < s)
@@ -63,7 +64,7 @@ __global__ void reduce_first_add(const float *g_idata, float *g_odata, unsigned 
         __syncthreads();
     }
 
-    // Guardamos el resultado parcial de este bloque en memoria global
+    // escribo la suma parcial del bloque en memoria global.
     if (tid == 0)
     {
         g_odata[blockIdx.x] = sdata[0];
@@ -71,19 +72,15 @@ __global__ void reduce_first_add(const float *g_idata, float *g_odata, unsigned 
 }
 
 // ====================== HELPER EN HOST ======================
-// Calcula el promedio de N*N valores almacenados en device usando la reducción anterior.
+// calculo el promedio de la grilla N x N que está en la GPU usando el kernel de reduccion.
 static float compute_grid_average_device(const float *d_vals, int N)
 {
     const size_t n = (size_t)N * (size_t)N;
-    if (n == 0)
-    {
-        return 0.0f;
-    }
 
-    const int threads = 256;
+    const int threads = 256; // hilos por bloque para la reducción
     const int blocks = (int)((n + threads * 2 - 1) / (threads * 2));
 
-    // Verificación básica: el buffer global d_partial debe haberse reservado en initialize_grid
+    // me aseguro de que el buffer d_partial exista y tenga tamaño suficiente.
     if (d_partial == NULL || d_partial_blocks < blocks)
     {
         fprintf(stderr, "Error: d_partial no inicializado o tamaño insuficiente (bloques requeridos = %d, disponibles = %d)\n",
@@ -91,11 +88,11 @@ static float compute_grid_average_device(const float *d_vals, int N)
         exit(1);
     }
 
-    // Lanzamos la reducción en GPU
+    // lanzo la reduccion en GPU.
     reduce_first_add<<<blocks, threads, threads * sizeof(float)>>>(d_vals, d_partial, (unsigned int)n);
     HANDLE_ERROR(cudaDeviceSynchronize());
 
-    // Reserva/crecimiento del buffer reutilizable en HOST
+    // reservo o agrando el buffer reutilizable en host si hace falta.
     if (h_partial_capacity < blocks)
     {
         float *new_buf = (float *)realloc(h_partial, blocks * sizeof(float));
@@ -112,6 +109,7 @@ static float compute_grid_average_device(const float *d_vals, int N)
         h_partial_capacity = blocks;
     }
 
+    // bajo las sumas parciales a host.
     HANDLE_ERROR(cudaMemcpy(h_partial, d_partial, blocks * sizeof(float), cudaMemcpyDeviceToHost));
 
     float sum = 0.0f;
@@ -123,36 +121,80 @@ static float compute_grid_average_device(const float *d_vals, int N)
     return sum / (float)n;
 }
 
-// ====================== KERNEL (DEVICE) ======================
-// Hilo = Celda (x,y). Sin shared memory. Sólo registros + global memory.
+// ====================== KERNEL DE DIFUSIÓN (DEVICE) ======================
+// Cada hilo actualiza una celda (x,y) usando 5 puntos.
+// Uso shared memory 2D con un halo de 1 celda alrededor del bloque para poder leer los vecinos que no pertenecen al bloque.
 __global__ void diffuse5_kernel(const float *in, float *out, int N, float D)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x; // columna
-    int y = blockIdx.y * blockDim.y + threadIdx.y; // fila
-    if (x >= N || y >= N)
+    extern __shared__ float tile[];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int gx = blockIdx.x * blockDim.x + tx; // columna global
+    int gy = blockIdx.y * blockDim.y + ty; // fila global
+
+    int tile_w = blockDim.x + 2; // ancho del tile incluyendo el halo
+    int lx = tx + 1;             // indice local X dentro del tile
+    int ly = ty + 1;             // indice local Y dentro del tile
+
+    // indice global lineal (sólo válido si gx, gy están en grilla).
+    int g_idx = gy * N + gx;
+
+    // Cargo la celda central del hilo.
+    if (gx < N && gy < N)
+    {
+        tile[ly * tile_w + lx] = in[g_idx];
+    }
+
+    // Cargo el halo en X (vecinos izquierdo y derecho).
+    // vecino izquierdo.
+    if (tx == 0 && gx > 0 && gy < N)
+    {
+        tile[ly * tile_w + 0] = in[gy * N + (gx - 1)];
+    }
+    // vecino derecho.
+    if (tx == blockDim.x - 1 && gx + 1 < N && gy < N)
+    {
+        tile[ly * tile_w + (tile_w - 1)] = in[gy * N + (gx + 1)];
+    }
+
+    // Cargo el halo en Y (vecinos superior e inferior).
+    // vecino superior.
+    if (ty == 0 && gy > 0 && gx < N)
+    {
+        tile[0 * tile_w + lx] = in[(gy - 1) * N + gx];
+    }
+    // vecino inferior.
+    if (ty == blockDim.y - 1 && gy + 1 < N && gx < N)
+    {
+        tile[(blockDim.y + 1) * tile_w + lx] = in[(gy + 1) * N + gx];
+    }
+
+    __syncthreads();
+
+    // Si el hilo quedó fuera de la grilla, no hago nada más.
+    if (gx >= N || gy >= N)
         return;
 
-    int idx = y * N + x;
-
-    // Frontera fija
-    if (x == 0 || y == 0 || x == N - 1 || y == N - 1)
+    // En la frontera copio el valor original
+    if (gx == 0 || gy == 0 || gx == N - 1 || gy == N - 1)
     {
-        out[idx] = in[idx];
+        out[g_idx] = in[g_idx];
         return;
     }
 
-    float c = in[idx];
-    float up = in[(y - 1) * N + x];
-    float dn = in[(y + 1) * N + x];
-    float lf = in[y * N + (x - 1)];
-    float rg = in[y * N + (x + 1)];
+    // Para celdas interiores uso sólo shared memory para leer vecinos.
+    float c = tile[ly * tile_w + lx];
+    float up = tile[(ly - 1) * tile_w + lx];
+    float dn = tile[(ly + 1) * tile_w + lx];
+    float lf = tile[ly * tile_w + (lx - 1)];
+    float rg = tile[ly * tile_w + (lx + 1)];
 
     float sum = up + dn + lf + rg;
-    out[idx] = c + D * (sum - 4.0f * c);
+    out[g_idx] = c + D * (sum - 4.0f * c);
 }
 
-// HOST
-// Misma funcion que en heat_simulation.c
+// se mantienen las fuentes de calor fijas en la grilla
 void mantener_fuentes_de_calor(float *_grid)
 {
     int cx = grid_size / 2;
@@ -169,42 +211,34 @@ void mantener_fuentes_de_calor(float *_grid)
 
 void initialize_grid(int N)
 {
-    // ===== HOST: reservo y limpio el buffer que pinta OpenGL =====
+    // reservo y limpio la grilla
     grid_size = N;
     size_t bytes = (size_t)N * (size_t)N * sizeof(float);
 
-    // Reset de flags de equilibrio para una nueva simulación
+    // limpio el estado de equilibrio para arrancar una simulación
     equilibrium_reached = 0;
     has_prev_avg = 0;
     prev_avg = 0.0f;
 
     grid = (float *)malloc(bytes);
-    if (grid == NULL)
-    {
-        fprintf(stderr, "Error: malloc grid\n");
-        exit(1);
-    }
 
     for (int i = 0; i < N * N; i++)
         grid[i] = 0.0f;
 
-    // Pinto las fuentes en HOST para verlas desde el primer frame
-    mantener_fuentes_de_calor(grid); // HOST write
+    // pongo las fuentes en grid para verlas desde el primer frame.
+    mantener_fuentes_de_calor(grid);
 
-    // ===== DEVICE: reservo buffers en memoria global de GPU =====
+    // reservo los buffers en memoria global de la GPU.
     HANDLE_ERROR(cudaMalloc((void **)&d_grid, bytes));
     HANDLE_ERROR(cudaMalloc((void **)&d_new, bytes));
 
-    // Buffer global para resultados parciales de la reducción (para el promedio)
-    if (bytes > 0)
-    {
-        const size_t n = (size_t)N * (size_t)N;
-        const int threads = 256;
-        d_partial_blocks = (int)((n + threads * 2 - 1) / (threads * 2));
-        HANDLE_ERROR(cudaMalloc((void **)&d_partial, d_partial_blocks * sizeof(float)));
-    }
+    // reservo el buffer global para las sumas parciales de la reduccion (promedio).
+    const size_t n = (size_t)N * (size_t)N;
+    const int threads = 256;
+    d_partial_blocks = (int)((n + threads * 2 - 1) / (threads * 2));
+    HANDLE_ERROR(cudaMalloc((void **)&d_partial, d_partial_blocks * sizeof(float)));
 
-    // Subo el estado inicial (con fuentes) a la GPU
+    // Subo el estado inicial (ya con fuentes) a la GPU.
     HANDLE_ERROR(cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice));
 }
 
@@ -214,20 +248,23 @@ void update_simulation()
     if (N <= 0)
         return;
 
-    // Si ya alcanzamos el equilibrio, no avanzamos más la simulación.
+    // Si ya alcanzamos el equilibrio, no avanzamos mas la simulacion.
     if (equilibrium_reached)
         return;
 
-    // 1) Configuración de la grilla de hilos
+    // Defino el tamaño de los bloques y la grilla de hilos.
     dim3 block(32, 8); // 256 hilos por bloque
     dim3 gridDim((N + block.x - 1) / block.x,
                  (N + block.y - 1) / block.y);
 
-    // 2) Paso de difusión en GPU: d_grid (T(t)) -> d_new (T(t+1))
-    diffuse5_kernel<<<gridDim, block>>>(d_grid, d_new, N, diffusion_rate);
+    // Calculo cuánta shared memory necesito para el tile 2D
+    size_t shared_bytes = (block.x + 2) * (block.y + 2) * sizeof(float);
+
+    // paso de difusión en GPU: d_grid (T(t)) -> d_new (T(t+1)).
+    diffuse5_kernel<<<gridDim, block, shared_bytes>>>(d_grid, d_new, N, diffusion_rate);
     HANDLE_ERROR(cudaDeviceSynchronize());
 
-    // 3) Calculamos el promedio de la grilla en GPU a partir de d_new
+    // Calculo el promedio de la grilla en GPU a partir de d_new.
     float current_avg = compute_grid_average_device(d_new, N);
     if (has_prev_avg)
     {
@@ -242,20 +279,19 @@ void update_simulation()
     prev_avg = current_avg;
     has_prev_avg = 1;
 
-    // 4) Traigo T(t+1) a HOST para dibujar
+    // Traigo T(t+1) a host para dibujar.
     size_t bytes = (size_t)N * (size_t)N * sizeof(float);
     HANDLE_ERROR(cudaMemcpy(grid, d_new, bytes, cudaMemcpyDeviceToHost));
 
-    // 5) Repongo fuentes en HOST
     mantener_fuentes_de_calor(grid);
 
-    // 6) Subo T(t+1) con fuentes a d_grid (será la nueva entrada)
+    // subo T(t+1) (ya con fuentes) a d_grid, que va a ser la entrada del próximo paso.
     HANDLE_ERROR(cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice));
 }
 
 void destroy__grid()
 {
-    // HOST: libero memoria en CPU y GPU
+    // libero toda la memoria en CPU y GPU.
 
     free(grid);
     grid = NULL;
@@ -272,12 +308,10 @@ void destroy__grid()
     d_partial = NULL;
     d_partial_blocks = 0;
 
-    // Liberar buffer reutilizable en HOST para la reducción
     free(h_partial);
     h_partial = NULL;
     h_partial_capacity = 0;
 
-    // Reset de estado de equilibrio
     equilibrium_reached = 0;
     has_prev_avg = 0;
     prev_avg = 0.0f;
