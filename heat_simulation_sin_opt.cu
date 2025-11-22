@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "heat_simulation.h"
+#include "cuda_utils.cuh"
 
 // ====================== VARIABLES GLOBALES (HOST) ======================
 // Estas dos son usadas por main.c (HOST).
@@ -80,20 +81,20 @@ void initialize_grid(int N)
 
     // ===== DEVICE: reservo buffers en memoria global de GPU =====
     // d_grid = T(t), d_new = T(t+1)
-    if (cudaMalloc((void **)&d_grid, bytes) != cudaSuccess)
-    {
-        fprintf(stderr, "Error: cudaMalloc d_grid\n");
-        exit(1);
-    }
-    if (cudaMalloc((void **)&d_new, bytes) != cudaSuccess)
-    {
-        fprintf(stderr, "Error: cudaMalloc d_new\n");
-        exit(1);
-    }
+    HANDLE_ERROR(cudaMalloc((void **)&d_grid, bytes));
+    HANDLE_ERROR(cudaMalloc((void **)&d_new, bytes));
 
     // Subo el estado inicial (con fuentes) a la GPU
-    cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice); // H2D
+    HANDLE_ERROR(cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice)); // H2D
     // d_new queda sin inicializar: el kernel lo va a escribir completo cada paso
+}
+
+// Versión compatible con la interfaz general: el parámetro threads_per_block
+// se acepta pero no se usa en esta implementación sin optimizaciones.
+void initialize_grid_with_block(int N, int threads_per_block)
+{
+    (void)threads_per_block;
+    initialize_grid(N);
 }
 
 void update_simulation()
@@ -108,18 +109,32 @@ void update_simulation()
                  (N + block.y - 1) / block.y); // Total de threads con N=400: 256 * 28 * 28 = 200704 sabiendo que 400 x 400 = 160000 -> alcanza
 
     // 2) Paso de difusión en GPU: d_grid (T(t)) -> d_new (T(t+1))
+    // Medimos el tiempo de ejecución de diffuse5_kernel con eventos de CUDA.
+    cudaEvent_t start_diff, stop_diff;
+    HANDLE_ERROR(cudaEventCreate(&start_diff));
+    HANDLE_ERROR(cudaEventCreate(&stop_diff));
+
+    HANDLE_ERROR(cudaEventRecord(start_diff, 0));
     diffuse5_kernel<<<gridDim, block>>>(d_grid, d_new, N, diffusion_rate);
-    cudaDeviceSynchronize(); // Esperamos a que termine el kernel
+    HANDLE_ERROR(cudaEventRecord(stop_diff, 0));
+    HANDLE_ERROR(cudaEventSynchronize(stop_diff));
+
+    float ms_diff = 0.0f;
+    HANDLE_ERROR(cudaEventElapsedTime(&ms_diff, start_diff, stop_diff));
+    printf("Tiempo diffuse5_kernel (sin_opt): %f ms\n", ms_diff);
+
+    HANDLE_ERROR(cudaEventDestroy(start_diff));
+    HANDLE_ERROR(cudaEventDestroy(stop_diff));
 
     // 3) Traigo T(t+1) a HOST para dibujar
     size_t bytes = (size_t)N * (size_t)N * sizeof(float);
-    cudaMemcpy(grid, d_new, bytes, cudaMemcpyDeviceToHost); // D2H
+    HANDLE_ERROR(cudaMemcpy(grid, d_new, bytes, cudaMemcpyDeviceToHost)); // D2H
 
     // 4) Repongo fuentes en HOST
     mantener_fuentes_de_calor(grid);
 
     // 5) Subo T(t+1) con fuentes a d_grid (será la nueva entrada)
-    cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice); // H2D
+    HANDLE_ERROR(cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice)); // H2D
 }
 
 void destroy__grid()
@@ -131,9 +146,9 @@ void destroy__grid()
 
     grid_size = 0;
 
-    cudaFree(d_grid);
+    HANDLE_ERROR(cudaFree(d_grid));
     d_grid = NULL;
 
-    cudaFree(d_new);
+    HANDLE_ERROR(cudaFree(d_new));
     d_new = NULL;
 }

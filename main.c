@@ -165,13 +165,38 @@ void mouseWheel(int wheel, int direction, int x, int y)
 int main(int argc, char *argv[])
 {
     int N = 400;
+    int threads_per_block = 32 * 8; // valor por defecto: 256 hilos por bloque (32x8)
+
+    if (argc >= 3)
+    {
+        N = atoi(argv[1]);
+        threads_per_block = atoi(argv[2]);
+    }
+
+    if (N <= 0)
+    {
+        fprintf(stderr, "Error: N debe ser mayor que 0.\n");
+        return 1;
+    }
+
+    if (threads_per_block < 32 || (threads_per_block % 32) != 0)
+    {
+        fprintf(stderr, "Error: hilos_por_bloque debe ser múltiplo de 32 y al menos 32.\n");
+        return 1;
+    }
+
+    if (threads_per_block > 1024)
+    {
+        fprintf(stderr, "Error: hilos_por_bloque no puede exceder 1024.\n");
+        return 1;
+    }
 
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInitWindowSize(WIDTH, HEIGHT);
     glutCreateWindow("Simulacion de Calor 2D (Modelo separado)");
 
-    initialize_grid(N);
+    initialize_grid_with_block(N, threads_per_block);
 
     glutDisplayFunc(display);
     glutReshapeFunc(reshape);

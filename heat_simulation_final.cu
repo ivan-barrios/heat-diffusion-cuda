@@ -8,6 +8,10 @@
 float *grid = NULL; // buffer en CPU de grilla.
 int grid_size = 0;  // lado N de la grilla (N x N celdas)
 
+// configuración por defecto de hilos por bloque para el kernel de difusión
+static int block_dim_x = 32; // mínimo 32 hilos por fila (warp completo)
+static int block_dim_y = 8;  // 32 * 8 = 256 hilos por bloque por defecto
+
 // buffer en host para la reducción (cálculo del promedio).
 static float *h_partial = NULL;
 static int h_partial_capacity = 0;
@@ -90,7 +94,6 @@ static float compute_grid_average_device(const float *d_vals, int N)
 
     // lanzo la reduccion en GPU.
     reduce_first_add<<<blocks, threads, threads * sizeof(float)>>>(d_vals, d_partial, (unsigned int)n);
-    HANDLE_ERROR(cudaDeviceSynchronize());
 
     // reservo o agrando el buffer reutilizable en host si hace falta.
     if (h_partial_capacity < blocks)
@@ -119,6 +122,28 @@ static float compute_grid_average_device(const float *d_vals, int N)
     }
 
     return sum / (float)n;
+}
+
+static void set_block_config_from_threads(int threads_per_block)
+{
+    if (threads_per_block < 32)
+    {
+        fprintf(stderr, "Error: hilos_por_bloque (%d) debe ser al menos 32.\n", threads_per_block);
+        exit(1);
+    }
+    if (threads_per_block % 32 != 0)
+    {
+        fprintf(stderr, "Error: hilos_por_bloque (%d) debe ser múltiplo de 32.\n", threads_per_block);
+        exit(1);
+    }
+    if (threads_per_block > 1024)
+    {
+        fprintf(stderr, "Error: hilos_por_bloque (%d) no puede exceder 1024 (límite de CUDA).\n", threads_per_block);
+        exit(1);
+    }
+
+    block_dim_x = 32;
+    block_dim_y = threads_per_block / 32;
 }
 
 // ====================== KERNEL DE DIFUSIÓN (DEVICE) ======================
@@ -194,23 +219,29 @@ __global__ void diffuse5_kernel(const float *in, float *out, int N, float D)
     out[g_idx] = c + D * (sum - 4.0f * c);
 }
 
-// se mantienen las fuentes de calor fijas en la grilla
-void mantener_fuentes_de_calor(float *_grid)
+// versión device: se mantienen las fuentes de calor fijas directamente en la GPU
+__global__ void mantener_fuentes_device(float *grid, int N)
 {
-    int cx = grid_size / 2;
-    int cy = grid_size / 2;
-
-    _grid[cy * grid_size + cx] = 100.0f;
-
+    int cx = N / 2;
+    int cy = N / 2;
     int offset = 20;
-    _grid[(cy + offset) * grid_size + (cx + offset)] = 100.0f;
-    _grid[(cy + offset) * grid_size + (cx - offset)] = 100.0f;
-    _grid[(cy - offset) * grid_size + (cx + offset)] = 100.0f;
-    _grid[(cy - offset) * grid_size + (cx - offset)] = 100.0f;
+
+    // Un solo hilo se encarga de escribir las fuentes
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+    {
+        grid[cy * N + cx] = 100.0f;
+
+        grid[(cy + offset) * N + (cx + offset)] = 100.0f;
+        grid[(cy + offset) * N + (cx - offset)] = 100.0f;
+        grid[(cy - offset) * N + (cx + offset)] = 100.0f;
+        grid[(cy - offset) * N + (cx - offset)] = 100.0f;
+    }
 }
 
-void initialize_grid(int N)
+void initialize_grid_with_block(int N, int threads_per_block)
 {
+    set_block_config_from_threads(threads_per_block);
+
     // reservo y limpio la grilla
     grid_size = N;
     size_t bytes = (size_t)N * (size_t)N * sizeof(float);
@@ -221,12 +252,8 @@ void initialize_grid(int N)
     prev_avg = 0.0f;
 
     grid = (float *)malloc(bytes);
-
     for (int i = 0; i < N * N; i++)
         grid[i] = 0.0f;
-
-    // pongo las fuentes en grid para verlas desde el primer frame.
-    mantener_fuentes_de_calor(grid);
 
     // reservo los buffers en memoria global de la GPU.
     HANDLE_ERROR(cudaMalloc((void **)&d_grid, bytes));
@@ -238,8 +265,12 @@ void initialize_grid(int N)
     d_partial_blocks = (int)((n + threads * 2 - 1) / (threads * 2));
     HANDLE_ERROR(cudaMalloc((void **)&d_partial, d_partial_blocks * sizeof(float)));
 
-    // Subo el estado inicial (ya con fuentes) a la GPU.
-    HANDLE_ERROR(cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice));
+    // Inicializo d_grid en GPU con ceros y repongo las fuentes directamente en device.
+    HANDLE_ERROR(cudaMemset(d_grid, 0, bytes));
+    mantener_fuentes_device<<<1, 1>>>(d_grid, N);
+
+    // Bajo el estado inicial a la CPU para el primer frame.
+    HANDLE_ERROR(cudaMemcpy(grid, d_grid, bytes, cudaMemcpyDeviceToHost));
 }
 
 void update_simulation()
@@ -252,8 +283,8 @@ void update_simulation()
     if (equilibrium_reached)
         return;
 
-    // Defino el tamaño de los bloques y la grilla de hilos.
-    dim3 block(32, 8); // 256 hilos por bloque
+    // Defino el tamaño de los bloques y la grilla de hilos (configurables).
+    dim3 block(block_dim_x, block_dim_y);
     dim3 gridDim((N + block.x - 1) / block.x,
                  (N + block.y - 1) / block.y);
 
@@ -262,31 +293,32 @@ void update_simulation()
 
     // paso de difusión en GPU: d_grid (T(t)) -> d_new (T(t+1)).
     diffuse5_kernel<<<gridDim, block, shared_bytes>>>(d_grid, d_new, N, diffusion_rate);
-    HANDLE_ERROR(cudaDeviceSynchronize());
 
     // Calculo el promedio de la grilla en GPU a partir de d_new.
     float current_avg = compute_grid_average_device(d_new, N);
     if (has_prev_avg)
     {
         float diff = fabsf(current_avg - prev_avg);
-        printf("diff = %f\n", diff);
         if (diff <= EPSILON)
         {
             equilibrium_reached = 1;
-            printf("Equilibrio alcanzado: avg = %f, diff = %f\n", current_avg, diff);
         }
     }
     prev_avg = current_avg;
     has_prev_avg = 1;
 
-    // Traigo T(t+1) a host para dibujar.
+    // Reponer las fuentes directamente en GPU sobre d_new (T(t+1)).
+    mantener_fuentes_device<<<1, 1>>>(d_new, N);
+
+    // Ahora d_new contiene T(t+1) ya con fuentes.
+    // Swap: d_grid apunta siempre al estado actual con fuentes.
+    float *tmp = d_grid;
+    d_grid = d_new;
+    d_new = tmp;
+
+    // Copiamos a host SOLO para que OpenGL pueda dibujar.
     size_t bytes = (size_t)N * (size_t)N * sizeof(float);
-    HANDLE_ERROR(cudaMemcpy(grid, d_new, bytes, cudaMemcpyDeviceToHost));
-
-    mantener_fuentes_de_calor(grid);
-
-    // subo T(t+1) (ya con fuentes) a d_grid, que va a ser la entrada del próximo paso.
-    HANDLE_ERROR(cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice));
+    HANDLE_ERROR(cudaMemcpy(grid, d_grid, bytes, cudaMemcpyDeviceToHost));
 }
 
 void destroy__grid()
@@ -298,13 +330,13 @@ void destroy__grid()
 
     grid_size = 0;
 
-    cudaFree(d_grid);
+    HANDLE_ERROR(cudaFree(d_grid));
     d_grid = NULL;
 
-    cudaFree(d_new);
+    HANDLE_ERROR(cudaFree(d_new));
     d_new = NULL;
 
-    cudaFree(d_partial);
+    HANDLE_ERROR(cudaFree(d_partial));
     d_partial = NULL;
     d_partial_blocks = 0;
 

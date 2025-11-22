@@ -3,22 +3,54 @@
 #include <stdlib.h>
 #include "heat_simulation.h"
 
-// Uso: ./heat_sim N pasos prefijo_salida
-// Ej:  ./heat_sim 400 1000 frames/frame_
+// Uso: ./heat_sim N pasos [hilos_por_bloque] prefijo_salida
+// Ej:  ./heat_sim 400 1000 256 frames/frame_   (256 = 32x8 hilos por bloque)
 
 int main(int argc, char *argv[])
 {
     if (argc < 4)
     {
-        fprintf(stderr, "Uso: %s N pasos prefijo_salida\n", argv[0]);
+        fprintf(stderr, "Uso: %s N pasos [hilos_por_bloque] prefijo_salida\n", argv[0]);
         return 1;
     }
 
     int N = atoi(argv[1]);     // tamaño de la grilla
     int steps = atoi(argv[2]); // cantidad de iteraciones
-    const char *prefix = argv[3];
 
-    initialize_grid(N);
+    int threads_per_block = 32 * 8; // valor por defecto: 256 hilos por bloque (32x8)
+    const char *prefix = NULL;
+
+    if (argc >= 5)
+    {
+        // Se especificó hilos_por_bloque explícitamente
+        threads_per_block = atoi(argv[3]);
+        prefix = argv[4];
+    }
+    else
+    {
+        fprintf(stderr, "Error: mal uso.\n");
+        return 1;
+    }
+
+    if (N <= 0)
+    {
+        fprintf(stderr, "Error: N debe ser mayor que 0.\n");
+        return 1;
+    }
+
+    if (threads_per_block < 32 || (threads_per_block % 32) != 0)
+    {
+        fprintf(stderr, "Error: hilos_por_bloque debe ser múltiplo de 32 y al menos 32.\n");
+        return 1;
+    }
+
+    if (threads_per_block > 1024)
+    {
+        fprintf(stderr, "Error: hilos_por_bloque no puede exceder 1024.\n");
+        return 1;
+    }
+
+    initialize_grid_with_block(N, threads_per_block);
 
     // Guardamos, por ejemplo, un frame cada 10 pasos
     int dump_every = 10;
@@ -42,8 +74,6 @@ int main(int argc, char *argv[])
             size_t total = (size_t)N * (size_t)N;
             fwrite(grid, sizeof(float), total, f);
             fclose(f);
-
-            printf("Guardado frame t=%d en %s\n", t, fname);
         }
     }
 

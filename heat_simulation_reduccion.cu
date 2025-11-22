@@ -91,9 +91,22 @@ static float compute_grid_average_device(const float *d_vals, int N)
         exit(1);
     }
 
-    // Lanzamos la reducción en GPU
+    // Lanzamos la reducción en GPU y medimos el tiempo en la GPU
+    cudaEvent_t start_red, stop_red;
+    HANDLE_ERROR(cudaEventCreate(&start_red));
+    HANDLE_ERROR(cudaEventCreate(&stop_red));
+
+    HANDLE_ERROR(cudaEventRecord(start_red, 0));
     reduce_first_add<<<blocks, threads, threads * sizeof(float)>>>(d_vals, d_partial, (unsigned int)n);
-    HANDLE_ERROR(cudaDeviceSynchronize());
+    HANDLE_ERROR(cudaEventRecord(stop_red, 0));
+    HANDLE_ERROR(cudaEventSynchronize(stop_red));
+
+    float ms_red = 0.0f;
+    HANDLE_ERROR(cudaEventElapsedTime(&ms_red, start_red, stop_red));
+    printf("Tiempo reduccion (reduce_first_add – reduccion): %f ms\n", ms_red);
+
+    HANDLE_ERROR(cudaEventDestroy(start_red));
+    HANDLE_ERROR(cudaEventDestroy(stop_red));
 
     // Reserva/crecimiento del buffer reutilizable en HOST
     if (h_partial_capacity < blocks)
@@ -208,6 +221,14 @@ void initialize_grid(int N)
     HANDLE_ERROR(cudaMemcpy(d_grid, grid, bytes, cudaMemcpyHostToDevice));
 }
 
+// Versión compatible con la interfaz general: el parámetro threads_per_block
+// se acepta pero no se usa en esta implementación con reducción.
+void initialize_grid_with_block(int N, int threads_per_block)
+{
+    (void)threads_per_block;
+    initialize_grid(N);
+}
+
 void update_simulation()
 {
     const int N = grid_size;
@@ -224,8 +245,22 @@ void update_simulation()
                  (N + block.y - 1) / block.y);
 
     // 2) Paso de difusión en GPU: d_grid (T(t)) -> d_new (T(t+1))
+    // Medimos el tiempo de ejecución de diffuse5_kernel con eventos de CUDA.
+    cudaEvent_t start_diff, stop_diff;
+    HANDLE_ERROR(cudaEventCreate(&start_diff));
+    HANDLE_ERROR(cudaEventCreate(&stop_diff));
+
+    HANDLE_ERROR(cudaEventRecord(start_diff, 0));
     diffuse5_kernel<<<gridDim, block>>>(d_grid, d_new, N, diffusion_rate);
-    HANDLE_ERROR(cudaDeviceSynchronize());
+    HANDLE_ERROR(cudaEventRecord(stop_diff, 0));
+    HANDLE_ERROR(cudaEventSynchronize(stop_diff));
+
+    float ms_diff = 0.0f;
+    HANDLE_ERROR(cudaEventElapsedTime(&ms_diff, start_diff, stop_diff));
+    printf("Tiempo diffuse5_kernel (reduccion): %f ms\n", ms_diff);
+
+    HANDLE_ERROR(cudaEventDestroy(start_diff));
+    HANDLE_ERROR(cudaEventDestroy(stop_diff));
 
     // 3) Calculamos el promedio de la grilla en GPU a partir de d_new
     float current_avg = compute_grid_average_device(d_new, N);
@@ -262,13 +297,13 @@ void destroy__grid()
 
     grid_size = 0;
 
-    cudaFree(d_grid);
+    HANDLE_ERROR(cudaFree(d_grid));
     d_grid = NULL;
 
-    cudaFree(d_new);
+    HANDLE_ERROR(cudaFree(d_new));
     d_new = NULL;
 
-    cudaFree(d_partial);
+    HANDLE_ERROR(cudaFree(d_partial));
     d_partial = NULL;
     d_partial_blocks = 0;
 

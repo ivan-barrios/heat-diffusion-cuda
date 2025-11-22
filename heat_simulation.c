@@ -36,6 +36,14 @@ void initialize_grid(int N)
     mantener_fuentes_de_calor(grid);
 }
 
+// Versión compatible con la interfaz general: el parámetro threads_per_block
+// se acepta pero no se usa en la implementación CPU.
+void initialize_grid_with_block(int N, int threads_per_block)
+{
+    (void)threads_per_block;
+    initialize_grid(N);
+}
+
 void update_simulation()
 {
     float sum;
